@@ -1,6 +1,5 @@
 import invariant from "invariant";
 import { compact, escapeRegExp, find, map } from "es-toolkit/compat";
-import queryParser from "pg-tsquery";
 import type {
   BindOrReplacements,
   FindAttributeOptions,
@@ -41,8 +40,8 @@ type RankedDocument = Document & {
 };
 
 /**
- * Search provider that uses PostgreSQL full-text search via tsvector.
- * Indexing is handled by database triggers, so index/remove/updateMetadata
+ * Search provider that uses PostgreSQL full-text search via PGroonga.
+ * Indexing is handled by the PGroonga index, so index/remove/updateMetadata
  * are no-ops.
  */
 export default class PostgresSearchProvider extends BaseSearchProvider {
@@ -52,11 +51,6 @@ export default class PostgresSearchProvider extends BaseSearchProvider {
    * The maximum length of a search query.
    */
   public static maxQueryLength = 1000;
-
-  /**
-   * Cached regex pattern for single quotes to avoid recompilation.
-   */
-  private static readonly SINGLE_QUOTE_REGEX = /'+/g;
 
   /**
    * Cached regex pattern for quoted queries.
@@ -407,7 +401,7 @@ export default class PostgresSearchProvider extends BaseSearchProvider {
     _model: SearchableModel,
     _item: Document | Collection | Comment
   ): Promise<void> {
-    // PostgreSQL uses tsvector triggers for indexing
+    // PostgreSQL uses a PGroonga index for search indexing
   }
 
   /**
@@ -520,11 +514,11 @@ export default class PostgresSearchProvider extends BaseSearchProvider {
 
     if (query) {
       const rankExpression = usePopularityBoost
-        ? `ts_rank("searchVector", to_tsquery('english', :query)) * (1 + 0.25 * LN(1 + COALESCE("popularityScore", 0)))`
-        : `ts_rank("searchVector", to_tsquery('english', :query))`;
+        ? `pgroonga_score(tableoid, ctid) * (1 + 0.25 * LN(1 + COALESCE("popularityScore", 0)))`
+        : `pgroonga_score(tableoid, ctid)`;
 
       attributes.push([Sequelize.literal(rankExpression), "searchRanking"]);
-      replacements["query"] = PostgresSearchProvider.webSearchQuery(query);
+      replacements["query"] = PostgresSearchProvider.pgroongaSearchQuery(query);
     }
 
     // When searching with a query and no explicit sort, prioritize search
@@ -756,11 +750,14 @@ export default class PostgresSearchProvider extends BaseSearchProvider {
 
       if (limitedQuery || iLikeQueries.length === 0) {
         where[Op.and].push(
-          Sequelize.fn(
-            `"searchVector" @@ to_tsquery`,
-            "english",
-            Sequelize.literal(":query")
-          )
+          Sequelize.literal(`
+             (ARRAY["title", "text"])::text[] &@~
+              (
+                :query,
+                ARRAY[5, 1],
+                'documents_pgroonga_search_idx'
+              )::pgroonga_full_text_search_condition
+          `)
         );
       }
     }
@@ -805,78 +802,21 @@ export default class PostgresSearchProvider extends BaseSearchProvider {
     };
   }
 
-  /**
-   * Convert a user search query into a format that can be used by Postgres.
-   *
-   * @param query - the user search query.
-   * @returns the query formatted for Postgres ts_query.
-   */
-  public static webSearchQuery(query: string): string {
-    // limit length of search queries as we're using regex against untrusted input
-    let limitedQuery = query.slice(0, PostgresSearchProvider.maxQueryLength);
+  private static pgroongaSearchQuery(query: string): string {
+    const likelyUrls = getUrls(query);
 
-    const quotedSearch =
-      limitedQuery.startsWith('"') && limitedQuery.endsWith('"');
-
-    // Replace single quote characters with &.
-    // Reset regex lastIndex to avoid state issues with global regex
-    PostgresSearchProvider.SINGLE_QUOTE_REGEX.lastIndex = 0;
-    const singleQuotes = limitedQuery.matchAll(
-      PostgresSearchProvider.SINGLE_QUOTE_REGEX
-    );
-
-    for (const match of singleQuotes) {
-      if (
-        match.index &&
-        match.index > 0 &&
-        match.index < limitedQuery.length - 1
-      ) {
-        limitedQuery =
-          limitedQuery.substring(0, match.index) +
-          "&" +
-          limitedQuery.substring(match.index + 1);
-      }
-    }
-
-    // Escape only once the phrase delimiters above have settled.
-    limitedQuery = PostgresSearchProvider.escapeTsQuery(limitedQuery);
-
-    return (
-      queryParser()(
-        // Although queryParser trims the query, looks like there's a
-        // bug for certain cases where it removes other characters in addition to
-        // spaces. Ref: https://github.com/caub/pg-tsquery/issues/27
-        quotedSearch ? limitedQuery.trim() : `${limitedQuery.trim()}*`
-      )
-        // Strip any trailing join (&) or escape (\) characters, in any
-        // combination, so we never hand to_tsquery an operator with no
-        // operand (e.g. a tail of "&\" would leave a dangling "&").
-        .replace(/[&\\]+$/, "")
-    );
+    return likelyUrls
+      .reduce((q, url) => q.replace(url, ""), query)
+      .slice(0, PostgresSearchProvider.maxQueryLength)
+      .trim()
+      .replace(/"([^"]*)"/g, "")
+      .trim();
   }
 
   private static escapeQuery(query: string): string {
     // replace "\" with escaped "\\" because sequelize.escape doesn't do it
     // see: https://github.com/sequelize/sequelize/issues/2950
     return query.replace(/\\/g, "\\\\");
-  }
-
-  /**
-   * Escapes the characters that are reserved in tsquery, segment by segment so
-   * that quoted phrases can be treated differently to the rest of the query.
-   *
-   * ":" only needs escaping inside a phrase, where pg-tsquery passes it through
-   * verbatim (see: https://github.com/outline/outline/issues/6542). Elsewhere
-   * pg-tsquery drops the colon but keeps a preceding backslash, which would
-   * leave to_tsquery with a dangling escape character.
-   */
-  private static escapeTsQuery(query: string): string {
-    return query.replace(/"[^"]*"|'[^']*'|[\s\S]/g, (segment) =>
-      // a match longer than the single character fallback is a quoted phrase
-      segment.length > 1
-        ? segment.replace(/[\\:]/g, "\\$&")
-        : segment.replace(/\\/g, "\\\\")
-    );
   }
 
   private static removeStopWords(query: string): string {
