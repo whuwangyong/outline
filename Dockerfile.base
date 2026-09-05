@@ -6,6 +6,10 @@ WORKDIR $APP_PATH
 COPY ./package.json ./yarn.lock ./.yarnrc.yml ./
 COPY ./patches ./patches
 
+RUN sed -i \
+    's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; \
+     s|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+    /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install -y cmake
 ENV NODE_OPTIONS="--max-old-space-size=24000"
 
